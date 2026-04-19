@@ -422,9 +422,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==========================================
 async def check_schedule_task(app: Application):
     print('🤖 Бот запущен! Мониторинг расписания...')
-    await asyncio.sleep(5)  # Ждём пока бот инициализируется
-
-    while True:
+    await asyncio.sleep(5)  # Ждём пока бот инициализируется    while True:
         try:
             print(f'[{datetime.now().strftime("%H:%M:%S")}] Проверяю расписание...')
 
