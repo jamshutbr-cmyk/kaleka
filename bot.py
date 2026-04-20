@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import asyncpg
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -26,11 +27,10 @@ if env_file.exists():
 # ==========================================
 BOT_TOKEN      = os.environ.get('BOT_TOKEN')
 PROXY_URL      = os.environ.get('PROXY_URL')
+DATABASE_URL   = os.environ.get('DATABASE_URL')
 SPREADSHEET_ID = '1SaeAr0Bh0WvluMPPHjBhCBlO3SjMFojB'
 SHEET_GID      = '297102740'
 CHECK_INTERVAL = 300
-USERS_FILE     = 'users.json'
-STATE_FILE     = 'state.json'
 
 CSV_URL = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid={SHEET_GID}'
 
@@ -43,31 +43,75 @@ DAY_EMOJI = {
 GROUP_COL_START = 2
 GROUP_COL_END   = 42
 
+# Глобальный пул соединений
+db_pool = None
+
 
 # ==========================================
-# РАБОТА С ПОЛЬЗОВАТЕЛЯМИ
+# БАЗА ДАННЫХ
 # ==========================================
-def load_users() -> dict:
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                chat_id    BIGINT PRIMARY KEY,
+                group_name TEXT NOT NULL,
+                col_index  INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS schedule_state (
+                col_index  INTEGER PRIMARY KEY,
+                data       TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+    print('✅ База данных инициализирована')
 
 
-def save_users(users: dict):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+async def db_get_user(chat_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT * FROM users WHERE chat_id = $1', chat_id)
+        if row:
+            return {'group': row['group_name'], 'col_index': row['col_index']}
+        return None
 
 
-def get_user(chat_id: int):
-    users = load_users()
-    return users.get(str(chat_id))
+async def db_set_user(chat_id: int, group: str, col_index: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO users (chat_id, group_name, col_index)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chat_id) DO UPDATE
+            SET group_name = $2, col_index = $3
+        ''', chat_id, group, col_index)
 
 
-def set_user_group(chat_id: int, group: str, col_index: int):
-    users = load_users()
-    users[str(chat_id)] = {'group': group, 'col_index': col_index}
-    save_users(users)
+async def db_get_all_users():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch('SELECT chat_id, group_name, col_index FROM users')
+        return {str(r['chat_id']): {'group': r['group_name'], 'col_index': r['col_index']} for r in rows}
+
+
+async def db_get_state(col_index: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('SELECT data FROM schedule_state WHERE col_index = $1', col_index)
+        if row:
+            return json.loads(row['data'])
+        return []
+
+
+async def db_set_state(col_index: int, data: list):
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO schedule_state (col_index, data, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (col_index) DO UPDATE
+            SET data = $2, updated_at = NOW()
+        ''', col_index, json.dumps(data, ensure_ascii=False))
 
 
 # ==========================================
@@ -172,21 +216,6 @@ def find_changes_smart(old: list, new: list, col_index: int, df=None) -> list:
 
 
 # ==========================================
-# СОСТОЯНИЕ
-# ==========================================
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def save_state(state: dict):
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(state, f, ensure_ascii=False)
-
-
-# ==========================================
 # ФОРМАТИРОВАНИЕ
 # ==========================================
 def escape_md(text: str) -> str:
@@ -244,7 +273,7 @@ def main_keyboard():
 # ==========================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user = get_user(chat_id)
+    user = await db_get_user(chat_id)
     if user:
         await update.message.reply_text(
             f'👋 *Привет\\!*\n\nТвоя группа: *{escape_md(user["group"])}*\nВыбери действие:',
@@ -273,7 +302,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = find_group(query, df)
         if result:
             group_name, col_idx = result
-            set_user_group(chat_id, group_name, col_idx)
+            await db_set_user(chat_id, group_name, col_idx)
             context.user_data['awaiting_group'] = False
             await update.message.reply_text(
                 f'✅ *Группа найдена\\!*\n\n'
@@ -284,8 +313,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             groups = get_groups(df)
-            query_up = query.upper()
-            similar = [name for name in groups if query_up in name.upper()][:10]
+            similar = [name for name in groups if query.upper() in name.upper()][:10]
             if similar:
                 buttons = [[InlineKeyboardButton(g, callback_data=f'select_group_{g}')] for g in similar]
                 await update.message.reply_text(
@@ -314,7 +342,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         groups = get_groups(df)
         col_idx = groups.get(group_name)
         if col_idx is not None:
-            set_user_group(chat_id, group_name, col_idx)
+            await db_set_user(chat_id, group_name, col_idx)
             context.user_data['awaiting_group'] = False
             await query.edit_message_text(
                 f'✅ *Группа выбрана\\!*\n\n'
@@ -325,12 +353,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    user = get_user(chat_id)
+    user = await db_get_user(chat_id)
     if not user:
-        await query.edit_message_text(
-            '⚠️ Сначала введи свою группу\\. Напиши /start',
-            parse_mode='MarkdownV2'
-        )
+        await query.edit_message_text('⚠️ Сначала введи свою группу\\. Напиши /start', parse_mode='MarkdownV2')
         return
 
     group = user['group']
@@ -348,18 +373,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text('⏳ Проверяю изменения\\.\\.\\.', parse_mode='MarkdownV2')
         df = load_df()
         current = get_column(col_idx, df)
-        state = load_state()
-        old = state.get(str(col_idx), [])
+        old = await db_get_state(col_idx)
         if not old:
-            state[str(col_idx)] = current
-            save_state(state)
+            await db_set_state(col_idx, current)
             msg = '✅ Состояние сохранено\\. Теперь буду отслеживать изменения\\!'
         else:
             changes = find_changes_smart(old, current, col_idx, df)
             if changes:
                 msg = format_changes(changes, group)
-                state[str(col_idx)] = current
-                save_state(state)
+                await db_set_state(col_idx, current)
             else:
                 msg = '✅ Изменений не обнаружено\\!'
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back')]]
@@ -368,9 +390,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == 'change_group':
         context.user_data['awaiting_group'] = True
         await query.edit_message_text(
-            f'⚙️ *Смена группы*\n\n'
-            f'Текущая группа: *{escape_md(group)}*\n\n'
-            f'Введи новый номер группы:',
+            f'⚙️ *Смена группы*\n\nТекущая группа: *{escape_md(group)}*\n\nВведи новый номер группы:',
             parse_mode='MarkdownV2'
         )
 
@@ -386,39 +406,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ФОНОВАЯ ПРОВЕРКА
 # ==========================================
 async def check_schedule_task(app: Application):
-    print('🤖 Бот запущен! Мониторинг расписания...')
+    print('🤖 Мониторинг расписания запущен...')
     await asyncio.sleep(5)
 
     while True:
         try:
             print(f'[{datetime.now().strftime("%H:%M:%S")}] Проверяю расписание...')
-            users = load_users()
+            users = await db_get_all_users()
             if not users:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
             df = load_df()
-            state = load_state()
 
+            # Собираем уникальные столбцы
             cols_to_check = {}
             for uid, udata in users.items():
                 col_idx = udata['col_index']
-                if str(col_idx) not in cols_to_check:
-                    cols_to_check[str(col_idx)] = {
-                        'col_index': col_idx,
-                        'group': udata['group'],
-                        'users': []
-                    }
-                cols_to_check[str(col_idx)]['users'].append(uid)
+                if col_idx not in cols_to_check:
+                    cols_to_check[col_idx] = {'group': udata['group'], 'users': []}
+                cols_to_check[col_idx]['users'].append(uid)
 
-            for col_key, col_data in cols_to_check.items():
-                col_idx = col_data['col_index']
+            for col_idx, col_data in cols_to_check.items():
                 group = col_data['group']
                 current = get_column(col_idx, df)
-                old = state.get(col_key, [])
+                old = await db_get_state(col_idx)
 
                 if not old:
-                    state[col_key] = current
+                    await db_set_state(col_idx, current)
                     continue
 
                 changes = find_changes_smart(old, current, col_idx, df)
@@ -436,9 +451,7 @@ async def check_schedule_task(app: Application):
                             )
                         except Exception as e:
                             print(f'Ошибка отправки пользователю {uid}: {e}')
-                    state[col_key] = current
-
-            save_state(state)
+                    await db_set_state(col_idx, current)
 
         except Exception as e:
             print(f'Ошибка в фоновой задаче: {e}')
@@ -450,8 +463,9 @@ async def check_schedule_task(app: Application):
 # ЗАПУСК
 # ==========================================
 async def main():
-    builder = ApplicationBuilder().token(BOT_TOKEN)
+    await init_db()
 
+    builder = ApplicationBuilder().token(BOT_TOKEN)
     if PROXY_URL:
         print(f'🔒 Используется прокси: {PROXY_URL}')
         builder.proxy(PROXY_URL).get_updates_proxy(PROXY_URL)
