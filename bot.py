@@ -28,8 +28,8 @@ if env_file.exists():
 BOT_TOKEN      = os.environ.get('BOT_TOKEN')
 PROXY_URL      = os.environ.get('PROXY_URL')
 DATABASE_URL   = os.environ.get('DATABASE_URL')
-SPREADSHEET_ID = '1SaeAr0Bh0WvluMPPHjBhCBlO3SjMFojB'
-SHEET_GID      = '297102740'
+SPREADSHEET_ID = '1iTFRmpc9yhjfkshGij7hri142_2O_xLo'
+SHEET_GID      = '1865507722'
 CHECK_INTERVAL = 300
 
 CSV_URL = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export?format=csv&gid={SHEET_GID}'
